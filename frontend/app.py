@@ -23,6 +23,15 @@ from llm_factory import get_llm_service
 from customer_service import generate_customer_service_reply_as_dict
 from insights import top_pain_points_from_results
 from rag_utils import SimpleRAGIndex
+from reporting import (
+    build_business_insight_payload,
+    build_report_html,
+    build_report_markdown,
+    build_report_snapshot_svg,
+    export_records_csv_bytes,
+    export_records_excel_bytes,
+    read_recent_log_events,
+)
 
 # 导入前端工具函数
 from utils.cleaning import clean_review_dataframe
@@ -191,6 +200,36 @@ def _results_to_records(res_df: pd.DataFrame) -> list[dict[str, Any]]:
         row["sentiment"] = str(row.get("sentiment", "")).strip().lower()
         row["pain_points"] = _coerce_text_list(row.get("pain_points"))
         records.append(row)
+    return records
+
+
+def _records_for_export(
+    res_df: pd.DataFrame,
+    source_df: pd.DataFrame | None = None,
+    text_col: str | None = None,
+) -> list[dict[str, Any]]:
+    records = _results_to_records(res_df)
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+        return records
+
+    for row in records:
+        try:
+            idx = int(row.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if idx not in source_df.index:
+            continue
+        source_row = source_df.loc[idx]
+        if isinstance(source_row, pd.DataFrame):
+            source_row = source_row.iloc[0]
+        for col, value in source_row.items():
+            key = f"source_{col}"
+            if key in row:
+                continue
+            if text_col and col == text_col and not row.get("raw_text"):
+                row["raw_text"] = value
+            elif col != text_col:
+                row[key] = value
     return records
 
 
@@ -702,6 +741,209 @@ def _render_pain_point_insights(res_df: pd.DataFrame | None, i18n: dict[str, str
                     st.caption(f"{i18n['insights_summary']}: {summary}")
 
 
+def _render_result_exports(res_df: pd.DataFrame, source_df: pd.DataFrame | None, i18n: dict[str, str]) -> None:
+    st.subheader(i18n["export_title"])
+    records = _records_for_export(
+        res_df,
+        source_df,
+        st.session_state.get(SS_BATCH_TEXT_COL),
+    )
+    col_csv, col_xlsx = st.columns(2)
+    with col_csv:
+        st.download_button(
+            i18n["export_csv"],
+            data=export_records_csv_bytes(records),
+            file_name="ai_analysis_results.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="download_analysis_csv",
+        )
+    with col_xlsx:
+        try:
+            excel_bytes = export_records_excel_bytes(records)
+            st.download_button(
+                i18n["export_excel"],
+                data=excel_bytes,
+                file_name="ai_analysis_results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="download_analysis_excel",
+            )
+        except Exception as exc:
+            st.warning(i18n["export_excel_unavailable"].format(e=exc))
+
+
+def _render_report_snapshot(
+    res_df: pd.DataFrame | None,
+    source_df: pd.DataFrame | None,
+    i18n: dict[str, str],
+    lang: str,
+) -> None:
+    st.subheader(i18n["report_title"])
+    if not isinstance(res_df, pd.DataFrame) or res_df.empty:
+        st.info(i18n["report_empty"])
+        return
+
+    config_a, config_b, config_c, config_d = st.columns(4)
+    with config_a:
+        top_k = st.slider(i18n["report_top_k"], min_value=3, max_value=10, value=5, step=1, key="report_top_k")
+    with config_b:
+        orders = st.number_input(
+            i18n["report_orders"],
+            min_value=0,
+            value=1000,
+            step=100,
+            key="report_orders",
+        )
+    with config_c:
+        average_order_value = st.number_input(
+            i18n["report_aov"],
+            min_value=0.0,
+            value=99.0,
+            step=10.0,
+            key="report_aov",
+        )
+    with config_d:
+        return_loss_rate = st.slider(
+            i18n["report_loss_rate"],
+            min_value=0.0,
+            max_value=0.8,
+            value=0.15,
+            step=0.01,
+            key="report_loss_rate",
+        )
+
+    records = _records_for_export(
+        res_df,
+        source_df,
+        st.session_state.get(SS_BATCH_TEXT_COL),
+    )
+    payload = build_business_insight_payload(
+        records,
+        source_name=st.session_state.get(SS_NAME, ""),
+        top_k=int(top_k),
+        estimated_orders_per_month=int(orders),
+        average_order_value=float(average_order_value),
+        return_loss_rate=float(return_loss_rate),
+        language=lang,
+    )
+
+    st.markdown(f"**{i18n['report_headline']}**")
+    st.info(payload["headline"])
+
+    metrics = payload["metrics"]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(i18n["insights_analyzed"], f"{int(metrics['analyzed_count']):,}")
+    m2.metric(i18n["insights_negative"], f"{metrics['negative_rate']:.1%}")
+    m3.metric(i18n["insights_coverage"], f"{metrics['pain_coverage']:.1%}")
+    m4.metric(i18n["insights_unique"], f"{int(metrics['unique_pain_points']):,}")
+
+    top_points = payload.get("top_pain_points", [])
+    if top_points:
+        rows = []
+        for item in top_points:
+            rec = item.get("recommendation", {})
+            rows.append(
+                {
+                    i18n["report_col_pain"]: item.get("pain_point", ""),
+                    i18n["report_col_count"]: item.get("count", 0),
+                    i18n["report_col_share"]: f"{item.get('share_of_negative', 0):.1%}",
+                    i18n["report_col_orders"]: item.get("estimated_affected_orders", 0),
+                    i18n["report_col_loss"]: item.get("estimated_monthly_loss", 0),
+                    i18n["report_col_action"]: rec.get("action", ""),
+                }
+            )
+        st.markdown(f"**{i18n['report_recommendations']}**")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    md = build_report_markdown(payload)
+    html_doc = build_report_html(payload)
+    svg = build_report_snapshot_svg(payload)
+    down_a, down_b, down_c = st.columns(3)
+    with down_a:
+        st.download_button(
+            i18n["report_download_md"],
+            data=md.encode("utf-8"),
+            file_name="business_insight_snapshot.md",
+            mime="text/markdown",
+            use_container_width=True,
+            key="download_report_md",
+        )
+    with down_b:
+        st.download_button(
+            i18n["report_download_html"],
+            data=html_doc.encode("utf-8"),
+            file_name="business_insight_snapshot.html",
+            mime="text/html",
+            use_container_width=True,
+            key="download_report_html",
+        )
+    with down_c:
+        st.download_button(
+            i18n["report_download_svg"],
+            data=svg.encode("utf-8"),
+            file_name="business_insight_snapshot.svg",
+            mime="image/svg+xml",
+            use_container_width=True,
+            key="download_report_svg",
+        )
+
+
+def _render_log_panel(i18n: dict[str, str]) -> None:
+    st.subheader(i18n["log_panel_title"])
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        limit = st.slider(i18n["log_limit"], min_value=20, max_value=500, value=100, step=20)
+    with col_b:
+        status_choice = st.selectbox(i18n["log_status_filter"], options=["all", "ok", "error", "guarded"])
+
+    try:
+        events = read_recent_log_events(
+            limit=int(limit),
+            status=None if status_choice == "all" else status_choice,
+        )
+    except Exception as exc:
+        st.error(i18n["log_error"].format(e=exc))
+        return
+
+    if not events:
+        st.info(i18n["log_empty"])
+        return
+
+    events_df = pd.DataFrame(events)
+    counts = events_df["status"].value_counts().reset_index()
+    counts.columns = ["status", "count"]
+    st.markdown(f"**{i18n['log_status_counts']}**")
+    st.dataframe(counts, use_container_width=True, hide_index=True)
+
+    display_cols = [
+        "ts",
+        "status",
+        "operation",
+        "provider",
+        "model",
+        "latency_ms",
+        "attempts",
+        "request_id",
+        "guardrail_action",
+        "error_type",
+        "error_message",
+    ]
+    st.dataframe(
+        events_df[[col for col in display_cols if col in events_df.columns]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.download_button(
+        i18n["log_download"],
+        data=export_records_csv_bytes(events),
+        file_name="backend_recent_logs.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="download_recent_logs",
+    )
+
+
 async def _run_batch_analysis(
     service,
     rows: list[tuple[int, str]],
@@ -779,8 +1021,10 @@ with st.sidebar:
             "page_subtitle": "基于大语言模型（LLM）的评论内容自动化情感分析与汇总。",
             "tab_batch": "批量分析",
             "tab_insights": "痛点洞察",
+            "tab_report": "报告快照",
             "tab_single": "单条评论",
             "tab_cs_chat": "模拟客服聊天",
+            "tab_admin": "后台日志",
             "expander_upload": "① 上传文件",
             "file_uploader_label": "选择 CSV 或 Excel",
             "upload_progress_receiving": "正在接收文件...",
@@ -836,6 +1080,34 @@ with st.sidebar:
             "insights_top_chart": "痛点排行",
             "insights_defect_list": "核心缺陷明细",
             "insights_summary": "AI 摘要",
+            "export_title": "结果导出",
+            "export_csv": "下载 CSV",
+            "export_excel": "下载 Excel",
+            "export_excel_unavailable": "Excel 导出不可用：{e}",
+            "report_title": "商业洞察报告快照",
+            "report_empty": "请先完成批量分析，再生成报告快照。",
+            "report_top_k": "报告痛点数量",
+            "report_orders": "预估月订单数",
+            "report_aov": "客单价",
+            "report_loss_rate": "退货损失率",
+            "report_headline": "核心结论",
+            "report_recommendations": "落地建议",
+            "report_col_pain": "痛点",
+            "report_col_count": "次数",
+            "report_col_share": "差评占比",
+            "report_col_orders": "预估影响订单",
+            "report_col_loss": "预估月损失",
+            "report_col_action": "建议动作",
+            "report_download_md": "下载 Markdown",
+            "report_download_html": "下载 HTML",
+            "report_download_svg": "下载长图 SVG",
+            "log_panel_title": "后台运行日志",
+            "log_limit": "最近日志条数",
+            "log_status_filter": "状态筛选",
+            "log_status_counts": "状态统计",
+            "log_empty": "暂无日志记录。",
+            "log_error": "读取日志失败：{e}",
+            "log_download": "下载日志 CSV",
             "cs_intro": "输入用户评论/提问，结合商家规则实时生成客服回复。",
             "cs_review": "用户评论 / 提问",
             "cs_rules": "商家规则（可留空）",
@@ -866,8 +1138,10 @@ with st.sidebar:
             "page_subtitle": "Automated review analysis dashboard powered by Large Language Models.",
             "tab_batch": "Batch Analysis",
             "tab_insights": "Pain Insights",
+            "tab_report": "Report Snapshot",
             "tab_single": "Single Review",
             "tab_cs_chat": "Simulated CS Chat",
+            "tab_admin": "Backend Logs",
             "expander_upload": "① Upload file",
             "file_uploader_label": "Select CSV or Excel",
             "upload_progress_receiving": "Receiving file...",
@@ -923,6 +1197,34 @@ with st.sidebar:
             "insights_top_chart": "Pain Point Ranking",
             "insights_defect_list": "Core Defect Details",
             "insights_summary": "AI Summary",
+            "export_title": "Result Export",
+            "export_csv": "Download CSV",
+            "export_excel": "Download Excel",
+            "export_excel_unavailable": "Excel export unavailable: {e}",
+            "report_title": "Business Insight Report Snapshot",
+            "report_empty": "Run batch analysis first to generate a report snapshot.",
+            "report_top_k": "Report pain points",
+            "report_orders": "Estimated monthly orders",
+            "report_aov": "Average order value",
+            "report_loss_rate": "Return loss rate",
+            "report_headline": "Headline",
+            "report_recommendations": "Actionable Recommendations",
+            "report_col_pain": "Pain Point",
+            "report_col_count": "Count",
+            "report_col_share": "Negative Share",
+            "report_col_orders": "Affected Orders",
+            "report_col_loss": "Monthly Loss",
+            "report_col_action": "Action",
+            "report_download_md": "Download Markdown",
+            "report_download_html": "Download HTML",
+            "report_download_svg": "Download Long SVG",
+            "log_panel_title": "Backend Runtime Logs",
+            "log_limit": "Recent log rows",
+            "log_status_filter": "Status filter",
+            "log_status_counts": "Status Counts",
+            "log_empty": "No log records yet.",
+            "log_error": "Failed to read logs: {e}",
+            "log_download": "Download Log CSV",
             "cs_intro": "Enter a customer review/question and generate an AI customer-service reply with merchant rules context.",
             "cs_review": "Customer review / question",
             "cs_rules": "Merchant rules (optional)",
@@ -969,8 +1271,8 @@ st.markdown(d["page_subtitle"])
 
 _inject_demo_css()
 
-tab_batch, tab_insights, tab_single, tab_cs = st.tabs(
-    [d["tab_batch"], d["tab_insights"], d["tab_single"], d["tab_cs_chat"]]
+tab_batch, tab_insights, tab_report, tab_single, tab_cs, tab_admin = st.tabs(
+    [d["tab_batch"], d["tab_insights"], d["tab_report"], d["tab_single"], d["tab_cs_chat"], d["tab_admin"]]
 )
 
 with st.expander(d["expander_upload"], expanded=True):
@@ -1133,6 +1435,7 @@ with tab_batch:
         if isinstance(res_df, pd.DataFrame) and not res_df.empty:
             st.subheader(d["result_table"])
             st.dataframe(res_df.drop(columns=["raw_text"], errors="ignore"), use_container_width=True)
+            _render_result_exports(res_df, df, d)
 
             failed_df = st.session_state.get(SS_BATCH_FAILED)
             st.subheader(d["failed_title"])
@@ -1198,6 +1501,9 @@ with tab_batch:
 
 with tab_insights:
     _render_pain_point_insights(st.session_state.get(SS_BATCH_RESULTS), d, lang)
+
+with tab_report:
+    _render_report_snapshot(st.session_state.get(SS_BATCH_RESULTS), df, d, lang)
 
 with tab_single:
     st.subheader(d["subheader_single"])
@@ -1352,3 +1658,6 @@ with tab_cs:
                 with st.expander(d["cs_retrieved_chunks"], expanded=False):
                     for idx, chunk in enumerate(chunks, start=1):
                         st.write(f"{idx}. {_shorten(chunk, 320)}")
+
+with tab_admin:
+    _render_log_panel(d)
