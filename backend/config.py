@@ -111,3 +111,18 @@ def get_llm_log_path() -> Path:
     if p:
         return Path(p)
     return Path(__file__).resolve().parent / "logs" / "llm_calls.jsonl"
+
+
+def get_app_db_path() -> Path:
+    p = os.environ.get("APP_DB_PATH", "").strip()
+    if p:
+        return Path(p)
+    return Path(__file__).resolve().parent / "data" / "app_state.json"
+
+
+def get_app_access_password() -> str:
+    return os.environ.get("APP_ACCESS_PASSWORD", "").strip()
+
+
+def get_app_admin_password() -> str:
+    return os.environ.get("APP_ADMIN_PASSWORD", "").strip()
