@@ -821,6 +821,14 @@ def _dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
+def _arrow_safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    safe_df = df.copy()
+    for col in safe_df.columns:
+        if safe_df[col].dtype == "object":
+            safe_df[col] = safe_df[col].map(lambda value: "" if value is None else str(value))
+    return safe_df
+
+
 def _summarize_result_errors(result_rows: list[dict[str, Any]]) -> tuple[int, list[tuple[str, int]]]:
     counts: dict[str, int] = {}
     for row in result_rows:
@@ -910,7 +918,7 @@ def _render_admin_center(i18n: dict[str, str]) -> None:
         {i18n["admin_config_key"]: "llm_log_path", i18n["admin_config_value"]: str(get_llm_log_path())},
     ]
     st.markdown(f"**{i18n['admin_config_title']}**")
-    st.dataframe(pd.DataFrame(config_rows), use_container_width=True, hide_index=True)
+    st.dataframe(_arrow_safe_dataframe(pd.DataFrame(config_rows)), use_container_width=True, hide_index=True)
 
     if events:
         error_types: dict[str, int] = {}
@@ -2267,6 +2275,11 @@ with st.sidebar:
             "history_rerun_success": "历史任务已重新执行，结果已刷新到当前会话。",
             "history_rerun_error": "重跑失败：{error}",
             "history_rerun_empty": "该任务没有可重跑的原始文本。",
+            "history_cancel_job": "取消任务",
+            "history_cancel_success": "任务已取消。",
+            "history_archive_job": "归档任务",
+            "history_unarchive_job": "取消归档",
+            "history_archive_success": "任务归档状态已更新。",
             "history_result_row": "行号",
             "history_result_preview": "评论预览",
             "history_result_sentiment": "情感",
