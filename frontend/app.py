@@ -407,7 +407,19 @@ def _get_configured_users() -> dict[str, dict[str, str]]:
 def _get_configured_taobao_cookie() -> str:
     secret_value = None
     try:
-        secret_value = st.secrets.get("TAOBAO_COOKIE")
+        for key in ("TAOBAO_COOKIE", "COOKIE", "cookie"):
+            candidate = st.secrets.get(key)
+            if candidate:
+                secret_value = candidate
+                break
+        if not secret_value:
+            taobao_section = st.secrets.get("taobao")
+            if isinstance(taobao_section, Mapping):
+                for key in ("cookie", "TAOBAO_COOKIE", "COOKIE"):
+                    candidate = taobao_section.get(key)
+                    if candidate:
+                        secret_value = candidate
+                        break
     except Exception:
         secret_value = None
     return str(secret_value or get_taobao_cookie() or "").strip()
